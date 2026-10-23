@@ -29,8 +29,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.sidebar.header("معلومات المشروع")
-st.sidebar.markdown("**Department:** Biomedical Engineering")
-st.sidebar.markdown("**Mode:** Verified Clinical Diagnostics")
+st.sidebar.markdown("**Department:**  Medical Instrumentation Engineering Techniques ")
+st.sidebar.markdown("**Mode:** Verified Diagnostics")
 
 @st.cache_resource
 def load_analyzer():
