@@ -1,98 +1,95 @@
 import os
+import glob
 import pandas as pd
 
-# تحديد مسارات البيانات المباشرة على القرص D
-RAW_DATA_DIR = r"D:\Scoliosis_Project\data_raw\Spinal-AI2024"
-OUTPUT_DIR = r"D:\Scoliosis_Project\data_processed"
+DATA_RAW_DIR = r"D:\Scoliosis_Project\data_raw"
+OUTPUT_CSV = os.path.join(DATA_RAW_DIR, "metadata.csv")
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+records = []
 
+# البحث عن كافة الصور
+image_extensions = ('*.jpg', '*.jpeg', '*.png', '*.bmp')
+all_image_paths = []
+for ext in image_extensions:
+    all_image_paths.extend(glob.glob(os.path.join(DATA_RAW_DIR, '**', ext), recursive=True))
 
-def process_cobb_file(txt_filename):
-    txt_path = os.path.join(RAW_DATA_DIR, txt_filename)
+print(f"تم العثور على {len(all_image_paths)} صورة في D:\\Scoliosis_Project\\data_raw")
 
-    if not os.path.exists(txt_path):
-        print(f" تنبيه: الملف غير موجود في المسار: {txt_path}")
-        print(" تأكد من تغيير اسم المجلد داخل data_raw إلى Spinal-AI2024 تماماً.")
-        return pd.DataFrame()
+for img_path in all_image_paths:
+    rel_path = os.path.relpath(img_path, DATA_RAW_DIR)
+    parts = rel_path.split(os.sep)
+    dataset_name = parts[0]
+    file_name = os.path.basename(img_path)
+    base_name, ext = os.path.splitext(file_name)
 
-    data = []
-    with open(txt_path, 'r', encoding='utf-8', errors='ignore') as f:
-        lines = f.readlines()
+    # استخراج التقسيم (train / valid / test)
+    split = "train"
+    for p in parts:
+        if p.lower() in ['train', 'valid', 'test']:
+            split = p.lower()
+            break
 
-    print(f" تم قراءة الملف {txt_filename} بنجاح، عدد الأسطر: {len(lines)}")
+    annotation_type = "unknown"
+    label_info = None
 
-    for line in lines:
-        # دعم الفصل سواء بالمسافات أو الفواصل
-        clean_line = line.strip().replace(',', ' ')
-        parts = clean_line.split()
+    # 1. Balanced Scoliosis (YOLOv5)
+    if "Balanced Scoliosis" in dataset_name:
+        annotation_type = "yolo_bbox"
+        txt_path = img_path.replace(f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}").replace(ext, ".txt")
+        label_info = txt_path if os.path.exists(txt_path) else None
 
-        if len(parts) < 4:
-            continue
+    # 2. Neurroradiology Dataset 2 (YOLO Polygon / OBB)
+    elif "Neurroradiology" in dataset_name:
+        annotation_type = "yolo_polygon_obb"
+        txt_path = img_path.replace(f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}").replace(ext, ".txt")
+        label_info = txt_path if os.path.exists(txt_path) else None
 
-        img_name = parts[0]
-        try:
-            cobb1 = float(parts[1])  # Upper Thoracic
-            cobb2 = float(parts[2])  # Main Thoracic
-            cobb3 = float(parts[3])  # Lumbar
-        except ValueError:
-            continue  # تجاهل أسطر العناوين إن وجدت
+    # 3. Scoliosis YOLOv5 Annotated Spine (Class 0: Vertebrae, Class 1: Full Region)
+    elif "Scoliosis YOLOv5 Annotated" in dataset_name:
+        annotation_type = "yolo_spine_vertebrae"
+        txt_path = img_path.replace(f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}").replace(ext, ".txt")
+        label_info = txt_path if os.path.exists(txt_path) else None
 
-        max_cobb = max(cobb1, cobb2, cobb3)
+    # 4. scoliosis-dataset (Folder Classification: healthy, 1-degree, 2-degree, 3-degree)
+    elif dataset_name == "scoliosis-dataset":
+        annotation_type = "folder_degree_classification"
+        for degree in ['healthy', '1-degree', '2-degree', '3-degree']:
+            if degree in parts:
+                label_info = degree
+                break
 
-        # 1. الشدة والدرجة
-        if max_cobb < 10.0:
-            intensity, stat = "Healthy", "0-derece"
-        elif 10.0 <= max_cobb < 25.0:
-            intensity, stat = "Mild", "1-derece"
-        elif 25.0 <= max_cobb < 45.0:
-            intensity, stat = "Moderate", "2-derece"
-        else:
-            intensity, stat = "Severe", "3-derece"
+    # 5. Spinal-AI2024 (COCO JSON)
+    elif dataset_name == "Spinal-AI2024":
+        annotation_type = "coco_json"
+        label_info = os.path.join(DATA_RAW_DIR, "Spinal_AI2024_test_annotation.json")
 
-        # 2. شكل الانحناء (C أم S)
-        significant_curves = sum([1 for angle in [cobb2, cobb3] if angle >= 10.0])
-        if significant_curves >= 2:
-            shape = "S"
-        elif significant_curves == 1:
-            shape = "C"
-        else:
-            shape = "Normal"
+    # 6. Vertebrae for Scoliosis mendeley (Segmentation Masks)
+    elif dataset_name == "Vertebrae for Scoliosis mendeley":
+        annotation_type = "segmentation_mask"
+        if "raw" in parts:
+            mask_path = img_path.replace(f"{os.sep}raw{os.sep}", f"{os.sep}masks{os.sep}").replace(ext, ".png")
+            label_info = mask_path if os.path.exists(mask_path) else None
 
-        # 3. الموقع
-        if max_cobb < 10.0:
-            location = "None"
-        elif max_cobb == cobb2:
-            location = "Thoracic"
-        elif max_cobb == cobb3:
-            location = "Lumbar"
-        else:
-            location = "Upper Thoracic"
+    # 7. xkt857dsxk-1 mendeley (Normal vs Scol)
+    elif dataset_name == "xkt857dsxk-1 mendeley":
+        annotation_type = "folder_binary_classification"
+        if "Normal" in parts:
+            label_info = "Normal"
+        elif "Scol" in parts:
+            label_info = "Scoliosis"
 
-        data.append({
-            "image_name": img_name,
-            "cobb_upper_thoracic": cobb1,
-            "cobb_main_thoracic": cobb2,
-            "cobb_lumbar": cobb3,
-            "max_cobb_angle": max_cobb,
-            "intensity": intensity,
-            "stat": stat,
-            "shape": shape,
-            "location": location
-        })
+    records.append({
+        "image_path": img_path,
+        "relative_path": rel_path,
+        "file_name": file_name,
+        "dataset_source": dataset_name,
+        "annotation_type": annotation_type,
+        "label_or_mask_path": label_info,
+        "split": split
+    })
 
-    return pd.DataFrame(data)
-
-
-if __name__ == "__main__":
-    print("--- معالجة بيانات التدريب ---")
-    df_train = process_cobb_file("Cobb_spinal-AI2024-train_gt.txt")
-    if not df_train.empty:
-        df_train.to_csv(os.path.join(OUTPUT_DIR, "metadata_train.csv"), index=False)
-        print(f" تم إنشاء metadata_train.csv بنجاح! عدد الصور: {len(df_train)}\n")
-
-    print("--- معالجة بيانات الاختبار ---")
-    df_test = process_cobb_file("Cobb_spinal-AI2024-test_gt.txt")
-    if not df_test.empty:
-        df_test.to_csv(os.path.join(OUTPUT_DIR, "metadata_test.csv"), index=False)
-        print(f" تم إنشاء metadata_test.csv بنجاح! عدد الصور: {len(df_test)}\n")
+df = pd.DataFrame(records)
+df.to_csv(OUTPUT_CSV, index=False)
+print(f"تم توليد ملف الفهرس الموحد بنجاح: {OUTPUT_CSV}")
+print("\nتوزيع الصور على المجموعات الـ 7:")
+print(df['dataset_source'].value_counts())
