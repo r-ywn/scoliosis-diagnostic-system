@@ -7,10 +7,10 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from torchvision import transforms
 from model import MultiTaskScoliosisResNet
-from predict_scoliosis_clinical import RefinedGradCAMPlusPlus
 
 BASE_DIR = r"D:\Scoliosis_Project"
-METADATA_CSV = os.path.join(BASE_DIR, r"data_raw\metadata.csv")
+METADATA_CSV = os.path.join(BASE_DIR, r"data_processed\clean_unified_metadata.csv")
+DATA_RAW_DIR = os.path.join(BASE_DIR, "data_raw")
 MODEL_PATH = "best_scoliosis_model_balanced.pth"
 OUTPUT_DIR = os.path.join(BASE_DIR, r"results\gradcam")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -24,89 +24,116 @@ val_transforms = transforms.Compose([
 ])
 
 
-def extract_severity_from_row(row):
-    path_str = (str(row.get('image_path', '')) + " " + str(row.get('label_or_mask_path', '')) + " " + str(
-        row.get('file_name', ''))).lower()
-    if "healthy" in path_str or "normal" in path_str:
-        return 0
-    elif "severe" in path_str or "3-degree" in path_str or "3_degree" in path_str:
-        return 3
-    elif "moderate" in path_str or "2-degree" in path_str or "2_degree" in path_str:
-        return 2
-    elif "mild" in path_str or "1-degree" in path_str or "1_degree" in path_str:
-        return 1
-    return 0
+def build_image_path_map(data_raw_dir):
+    image_map = {}
+    for root, _, files in os.walk(data_raw_dir):
+        for f in files:
+            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                if f not in image_map:
+                    image_map[f] = os.path.join(root, f)
+    return image_map
 
 
-def apply_spine_roi_mask(heatmap, img_shape):
-    """تعديل أبعاد الخريطة الحرارية وتطبيق القناع الموجه للعمود الفقري."""
+class PureGradCAMPlusPlus:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+        self.target_layer.register_forward_hook(self.save_activation)
+        self.target_layer.register_full_backward_hook(self.save_gradient)
+
+    def save_activation(self, module, input, output):
+        self.activations = output
+
+    def save_gradient(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0]
+
+    def generate_heatmap(self, input_image, target_class=None):
+        self.model.eval()
+        outputs = self.model(input_image)
+        logits = outputs['intensity']
+
+        if target_class is None:
+            target_class = torch.argmax(logits, dim=1).item()
+
+        self.model.zero_grad()
+        score = logits[0, target_class]
+        score.backward(retain_graph=True)
+
+        gradients = self.gradients[0].cpu().data.numpy()
+        activations = self.activations[0].cpu().data.numpy()
+
+        weights = np.mean(gradients, axis=(1, 2))
+        heatmap = np.sum(weights[:, None, None] * activations, axis=0)
+
+        heatmap = np.maximum(heatmap, 0)
+        max_val = np.max(heatmap)
+        if max_val > 0:
+            heatmap = heatmap / max_val
+        return heatmap
+
+
+def apply_torso_centered_attenuation(heatmap, img_shape):
+    """تطبيق تنعيم بؤري تدريجي لمنع انتفاخ الخريطة الحرارية نحو الحواف الخارجية للصور."""
     h, w = img_shape
-
-    # 1. تغيير حجم الخريطة الحرارية لتتطابق تماماً مع أبعاد الصورة الأصلية (w, h)
     if heatmap.shape != (h, w):
-        heatmap = cv2.resize(heatmap, (w, h))
+        heatmap = cv2.resize(heatmap, (w, h), interpolation=cv2.INTER_CUBIC)
 
-    # 2. إنشاء القناع الموجه لحجم الصورة الأصلي
-    mask = np.ones((h, w), dtype=np.float32)
+    x = np.linspace(-1, 1, w)
+    y = np.linspace(-1, 1, h)
+    xx, yy = np.meshgrid(x, y)
 
-    # تضعيف الحواف الجانبية (خارج نطاق العمود الفقري)
-    x_margin = int(w * 0.15)
-    mask[:, :x_margin] *= 0.2
-    mask[:, w - x_margin:] *= 0.2
+    # مرشح جيب التمام الملساء لتخفيف التشتت الخارجي
+    mask_x = np.cos(xx * np.pi * 0.45) ** 2
+    mask_x[np.abs(xx) > 0.85] = 0
 
-    # تضعيف المنطقة السفلية (منطقة الحوض)
-    y_pelvis = int(h * 0.82)
-    mask[y_pelvis:, :] *= 0.15
+    mask_y = np.cos(yy * np.pi * 0.45) ** 2
+    mask_y[np.abs(yy) > 0.85] = 0
 
-    # تنعيم حواف القناع
-    mask = cv2.GaussianBlur(mask, (51, 51), 0)
+    smooth_mask = mask_x * mask_y
+    focused_heatmap = heatmap * smooth_mask
 
-    # دمج القناع مع الخريطة الحرارية
-    refined_heatmap = heatmap * mask
+    max_v = np.max(focused_heatmap)
+    if max_v > 0:
+        focused_heatmap = focused_heatmap / max_v
 
-    # 3. قص الضوضاء الضعيفة لتركيز اللون الأحمر على قمة الانحناء (Curve Apex)
-    threshold = np.percentile(refined_heatmap, 60)
-    refined_heatmap[refined_heatmap < threshold] = 0
-
-    max_val = np.max(refined_heatmap)
-    if max_val > 0:
-        refined_heatmap = refined_heatmap / max_val
-
-    return refined_heatmap
+    return focused_heatmap
 
 
 def generate_refined_gradcam_grid():
     print("=" * 65)
-    print("[+] توليد شبكة Grad-CAM++ الموجهة حيوياً لقمة انحراف الفقرات")
+    print("[+] توليد خرائط Grad-CAM++ المجمعة والمركبة على العمود الفقري")
     print("=" * 65)
 
     if not os.path.exists(METADATA_CSV) or not os.path.exists(MODEL_PATH):
+        print(f"[ERROR] تعذر العثور على الميتاداتا النظيفة أو أوزان النموذج!")
         return
 
     df = pd.read_csv(METADATA_CSV)
-    df['computed_severity'] = df.apply(extract_severity_from_row, axis=1)
+    path_map = build_image_path_map(DATA_RAW_DIR)
 
     model = MultiTaskScoliosisResNet(pretrained=False).to(DEVICE)
     model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
     model.eval()
 
     target_layer = model.backbone.layer4[1].conv2
-    grad_cam = RefinedGradCAMPlusPlus(model, target_layer)
+    grad_cam = PureGradCAMPlusPlus(model, target_layer)
 
     sample_rows = []
-    for label_id in [0, 1, 2, 3]:
-        sub_df = df[df['computed_severity'] == label_id]
+    labels_text = ["Healthy", "Mild", "Moderate", "Severe"]
+
+    for label_name in labels_text:
+        sub_df = df[df['intensity'] == label_name]
         if len(sub_df) > 0:
-            sample_rows.append(sub_df.iloc[0])
-        else:
-            sample_rows.append(df.iloc[label_id % len(df)])
+            sample_rows.append((sub_df.iloc[0], label_name))
 
-    fig, axes = plt.subplots(len(sample_rows), 3, figsize=(10, 3 * len(sample_rows)))
-    labels_text = ["Healthy", "1-degree (Mild)", "2-degree (Moderate)", "3-degree (Severe)"]
+    fig, axes = plt.subplots(len(sample_rows), 3, figsize=(11, 3.2 * len(sample_rows)))
 
-    for idx, row in enumerate(sample_rows):
-        img_path = row['image_path']
-        if not os.path.exists(img_path):
+    for idx, (row, label_name) in enumerate(sample_rows):
+        img_name = str(row['image_name'])
+        img_path = path_map.get(img_name)
+        if not img_path or not os.path.exists(img_path):
             continue
 
         raw_bgr = cv2.imread(img_path)
@@ -116,37 +143,34 @@ def generate_refined_gradcam_grid():
         img_pil = Image.fromarray(cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2RGB))
 
         tensor_img = val_transforms(img_pil).unsqueeze(0).to(DEVICE)
-        tensor_img.requires_grad_()
 
-        # 1. استخراج الخريطة الحرارية الخام
-        raw_heatmap = grad_cam.generate_heatmap(tensor_img)
+        with torch.no_grad():
+            outputs = model(tensor_img)
+            pred_class = torch.argmax(outputs['intensity'], dim=1).item()
 
-        # 2. مطابقة الأبعاد وتطبيق قناع الفقرات وقمع ضوضاء الحوض
-        spine_heatmap = apply_spine_roi_mask(raw_heatmap, (h, w))
+        raw_heatmap = grad_cam.generate_heatmap(tensor_img, target_class=pred_class)
+        focused_heatmap = apply_torso_centered_attenuation(raw_heatmap, (h, w))
 
-        heatmap_colored = cv2.applyColorMap(np.uint8(255 * spine_heatmap), cv2.COLORMAP_JET)
-
-        overlay = cv2.addWeighted(raw_bgr, 0.65, heatmap_colored, 0.35, 0)
-
-        label_name = labels_text[idx]
+        heatmap_colored = cv2.applyColorMap(np.uint8(255 * focused_heatmap), cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(raw_bgr, 0.60, heatmap_colored, 0.40, 0)
 
         axes[idx, 0].imshow(cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2RGB))
         axes[idx, 0].set_title(f"Original X-Ray ({label_name})", fontsize=10)
         axes[idx, 0].axis('off')
 
         axes[idx, 1].imshow(cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB))
-        axes[idx, 1].set_title("Spine-Focused Heatmap", fontsize=10)
+        axes[idx, 1].set_title("Spine Grad-CAM++ Heatmap", fontsize=10)
         axes[idx, 1].axis('off')
 
         axes[idx, 2].imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
-        axes[idx, 2].set_title("Focused Region Overlay", fontsize=10)
+        axes[idx, 2].set_title("Spine Focus Overlay", fontsize=10)
         axes[idx, 2].axis('off')
 
     plt.tight_layout()
     summary_path = os.path.join(os.path.dirname(OUTPUT_DIR), "gradcam_summary_grid.png")
     plt.savefig(summary_path, dpi=300)
     plt.close()
-    print(f"[+] تم حفظ الخريطة الحرارية المحدثة بدقة عالية في: {summary_path}")
+    print(f"[+] تم تحديث وحفظ الخريطة الحرارية المجمعة بنجاح في: {summary_path}")
 
 
 if __name__ == "__main__":

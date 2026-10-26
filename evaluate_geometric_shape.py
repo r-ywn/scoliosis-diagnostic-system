@@ -30,7 +30,6 @@ def fit_spline_shape(landmarks_xy):
         return "C-shape", None, 0
 
     try:
-        # استخدام معامل تنعيم مرن يستوعب تشوه النقاط
         spline = UnivariateSpline(y_u, x_u, k=3, s=len(y_u) * 50)
         y_dense = np.linspace(np.min(y_u), np.max(y_u), 200)
         x_dense = spline(y_dense)
@@ -60,6 +59,20 @@ def parse_yolo_landmarks(label_path, img_width, img_height):
     return landmarks
 
 
+def find_label_path_for_image(img_path):
+    """استخراج تلقائي لمسار ملف الترقيم .txt المترابط مع الصورة."""
+    base_no_ext = os.path.splitext(img_path)[0]
+    possible_paths = [
+        base_no_ext + ".txt",
+        img_path.replace("images", "labels").rsplit('.', 1)[0] + ".txt",
+        img_path.replace("image", "label").rsplit('.', 1)[0] + ".txt"
+    ]
+    for p in possible_paths:
+        if os.path.exists(p):
+            return p
+    return None
+
+
 def run_shape_analysis_evaluation():
     print("=" * 65)
     print("[+] بدء التحليل الهندسي المطور باستخدام B-Splines")
@@ -69,16 +82,16 @@ def run_shape_analysis_evaluation():
         return
 
     df = pd.read_csv(METADATA_CSV)
-    annotated_df = df[df['annotation_type'].str.contains('yolo', case=False, na=False)].copy()
-
     results_summary = []
     sample_plots = 0
 
-    for idx, row in annotated_df.iterrows():
-        img_path = row['image_path']
-        label_path = row['label_or_mask_path']
+    for idx, row in df.iterrows():
+        img_path = str(row.get('image_path', ''))
+        if not os.path.exists(img_path):
+            continue
 
-        if not os.path.exists(img_path) or not str(label_path).endswith('.txt'):
+        label_path = find_label_path_for_image(img_path)
+        if label_path is None:
             continue
 
         img = cv2.imread(img_path)
@@ -120,6 +133,8 @@ def run_shape_analysis_evaluation():
         for shape_name, count in shape_counts.items():
             print(f"- {shape_name}: {count:,} حالة ({count/len(summary_df)*100:.1f}%)")
         summary_df.to_csv(os.path.join(OUTPUT_DIR, "geometric_shape_report.csv"), index=False)
+    else:
+        print("[+] اكتمل الفحص: لا توجد صور تحتوي على ملفات ترقيم .txt في قاعدة البيانات الحالية.")
 
 
 if __name__ == "__main__":
