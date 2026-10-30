@@ -8,7 +8,7 @@ from PIL import Image
 from torchvision import transforms
 from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix, precision_recall_fscore_support, roc_curve, auc
+from sklearn.metrics import confusion_matrix, precision_recall_fscore_support, roc_curve, auc, mean_absolute_error
 from model import MultiTaskScoliosisResNet
 
 BASE_DIR = r"D:\Scoliosis_Project"
@@ -28,7 +28,6 @@ val_transforms = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-
 def build_image_path_map(data_raw_dir):
     image_map = {}
     for root, _, files in os.walk(data_raw_dir):
@@ -37,7 +36,6 @@ def build_image_path_map(data_raw_dir):
                 if f not in image_map:
                     image_map[f] = os.path.join(root, f)
     return image_map
-
 
 class UnifiedDataset(Dataset):
     def __init__(self, df, path_map, transform=None):
@@ -51,16 +49,25 @@ class UnifiedDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         img_name = str(row['image_name'])
-        severity = INTENSITY_MAP.get(str(row['intensity']), 0)
+        severity = INTENSITY_MAP.get(str(row.get('intensity', 'Healthy')), 0)
+
+        has_cobb = bool(row.get('has_cobb_gt', False))
+        u_th = float(row.get('cobb_upper_thoracic', 0.0))
+        m_th = float(row.get('cobb_main_thoracic', 0.0))
+        lum_th = float(row.get('cobb_lumbar', 0.0))
+        max_cobb = float(row.get('max_cobb_angle', 0.0))
+
+        cobb_target = torch.tensor([u_th, m_th, lum_th, max_cobb], dtype=torch.float32)
+        has_cobb_mask = torch.tensor(1.0 if has_cobb else 0.0, dtype=torch.float32)
+
         img_path = self.path_map.get(img_name)
         try:
             image = Image.open(img_path).convert('RGB')
             if self.transform:
                 image = self.transform(image)
-            return image, severity
+            return image, severity, cobb_target, has_cobb_mask
         except Exception:
-            return torch.zeros((3, 224, 224)), severity
-
+            return torch.zeros((3, 224, 224)), severity, cobb_target, torch.tensor(0.0)
 
 def plot_and_save_cm(y_true, y_pred, title, filename):
     cm = confusion_matrix(y_true, y_pred)
@@ -72,7 +79,6 @@ def plot_and_save_cm(y_true, y_pred, title, filename):
     plt.tight_layout()
     plt.savefig(os.path.join(RESULTS_DIR, filename), dpi=300)
     plt.close()
-
 
 def evaluate_and_plot():
     print("=" * 70)
@@ -98,32 +104,52 @@ def evaluate_and_plot():
         dataset = UnifiedDataset(subset_df, path_map, transform=val_transforms)
         loader = DataLoader(dataset, batch_size=32, shuffle=False)
         preds, targets, probs = [], [], []
+        cobb_preds_list, cobb_targets_list = [], []
+
         with torch.no_grad():
-            for imgs, labels in loader:
+            for imgs, labels, cobb_gt, cobb_masks in loader:
                 imgs = imgs.to(DEVICE)
                 outputs = model(imgs)
+
                 logits = outputs['intensity']
                 pr = torch.softmax(logits, dim=1)
                 p = torch.argmax(pr, dim=1)
+
                 preds.extend(p.cpu().numpy())
                 targets.extend(labels.numpy())
                 probs.extend(pr.cpu().numpy())
-        return np.array(targets), np.array(preds), np.array(probs)
 
-    # 1. حساب وحفظ مصفوفات الارتباك الموحدة للـ Train, Val, Test
-    print("[1/3] حساب مصفوفة ارتباك التدريب...")
-    y_tr_true, y_tr_pred, _ = get_predictions(train_df)
+                # إلغاء التنميط لاستعادة درجات زوايا كوب الحقيقية
+                cobb_pred_deg = outputs['cobb_angles'].cpu().numpy() * 100.0
+                mask_indices = (cobb_masks == 1.0).numpy()
+
+                if np.sum(mask_indices) > 0:
+                    cobb_preds_list.append(cobb_pred_deg[mask_indices])
+                    cobb_targets_list.append(cobb_gt.numpy()[mask_indices])
+
+        cobb_preds_arr = np.vstack(cobb_preds_list) if cobb_preds_list else None
+        cobb_targets_arr = np.vstack(cobb_targets_list) if cobb_targets_list else None
+
+        return np.array(targets), np.array(preds), np.array(probs), cobb_targets_arr, cobb_preds_arr
+
+    # 1. حساب وحفظ مصفوفات الارتباك الموحدة
+    print("[1/4] حساب مصفوفة ارتباك التدريب...")
+    y_tr_true, y_tr_pred, _, _, _ = get_predictions(train_df)
     plot_and_save_cm(y_tr_true, y_tr_pred, "Confusion Matrix (Training Set)", "confusion_matrix_train.png")
 
-    print("[2/3] حساب مصفوفة ارتباك التحقق...")
-    y_val_true, y_val_pred, _ = get_predictions(val_df)
+    print("[2/4] حساب مصفوفة ارتباك التحقق...")
+    y_val_true, y_val_pred, _, _, _ = get_predictions(val_df)
     plot_and_save_cm(y_val_true, y_val_pred, "Confusion Matrix (Validation Set)", "confusion_matrix_val.png")
 
-    print("[3/3] حساب مصفوفة ارتباك للاختبار...")
-    y_ts_true, y_ts_pred, probs_ts = get_predictions(test_df)
+    print("[3/4] حساب مصفوفة ارتباك الاختبار وخسارة زوايا كوب...")
+    y_ts_true, y_ts_pred, probs_ts, cobb_gt_ts, cobb_pred_ts = get_predictions(test_df)
     plot_and_save_cm(y_ts_true, y_ts_pred, "Confusion Matrix (Clean Test Set)", "confusion_matrix_test.png")
 
-    # 2. رسم مقاييس الأداء المحدّثة
+    if cobb_pred_ts is not None:
+        mae_max = mean_absolute_error(cobb_gt_ts[:, 3], cobb_pred_ts[:, 3])
+        print(f"   [+] متوسط الخطأ المطلق لزاوية كوب القصوى (Test Max Cobb MAE): {mae_max:.2f}°")
+
+    # 2. رسم مقاييس الأداء المحدّثة (Precision, Recall, F1)
     precision, recall, f1, _ = precision_recall_fscore_support(y_ts_true, y_ts_pred, average=None)
     x = np.arange(len(CLASSES))
     width = 0.25
@@ -134,7 +160,7 @@ def evaluate_and_plot():
     plt.bar(x + width, f1, width, label='F1-Score', color='#5b9bd5')
     plt.xticks(x, CLASSES, fontsize=10)
     plt.ylabel("Score")
-    plt.title("Real Performance Metrics by Severity Category (Clean Metadata)")
+    plt.title("Real Performance Metrics by Severity Category (Clean Test Split)")
     plt.ylim(0, 1.1)
     plt.legend()
     plt.grid(axis='y', linestyle='--', alpha=0.5)
@@ -142,7 +168,7 @@ def evaluate_and_plot():
     plt.savefig(os.path.join(RESULTS_DIR, "performance_metrics.png"), dpi=300)
     plt.close()
 
-    # 3. رسم منحنيات ROC الخام
+    # 3. رسم منحنيات ROC الخام المباشرة
     plt.figure(figsize=(8, 6))
     for i, class_name in enumerate(CLASSES):
         y_true_binary = (y_ts_true == i).astype(int)
@@ -160,34 +186,7 @@ def evaluate_and_plot():
     plt.savefig(os.path.join(RESULTS_DIR, "roc_curves.jpg"), dpi=300)
     plt.close()
 
-    # 4. رسم منحنيات Loss & Accuracy
-    epochs = list(range(1, 21))
-    train_loss = [28.30, 9.63, 7.33, 6.50, 5.91, 5.51, 5.08, 4.19, 4.15, 3.94, 3.74, 3.74, 3.41, 3.23, 3.18, 3.17, 3.09, 3.00, 2.99, 2.78]
-    train_acc = [38.27, 56.01, 66.69, 71.36, 74.15, 75.74, 77.40, 78.70, 79.56, 79.68, 80.76, 80.50, 81.80, 81.88, 81.80, 82.20, 82.33, 82.11, 82.46, 82.92]
-    val_acc = [59.64, 68.82, 76.35, 80.44, 79.51, 73.37, 79.16, 77.69, 82.40, 79.19, 82.40, 81.61, 83.06, 82.06, 82.80, 82.94, 79.73, 81.61, 82.15, 81.92]
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
-    ax1.plot(epochs, train_loss, 'b-o', label='Train Loss', lw=2, ms=4)
-    ax1.set_title("Training Loss Progression (20 Epochs)")
-    ax1.set_xlabel("Epochs")
-    ax1.set_ylabel("Loss")
-    ax1.grid(True, linestyle='--', alpha=0.5)
-    ax1.legend()
-
-    ax2.plot(epochs, train_acc, 'b-o', label='Train Acc (%)', lw=2, ms=4)
-    ax2.plot(epochs, val_acc, 'g--^', label='Val Acc (%)', lw=2, ms=4)
-    ax2.set_title("Training & Validation Accuracy (%)")
-    ax2.set_xlabel("Epochs")
-    ax2.set_ylabel("Accuracy (%)")
-    ax2.grid(True, linestyle='--', alpha=0.5)
-    ax2.legend()
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "loss_and_accuracy_curves.jpg"), dpi=300)
-    plt.close()
-
-    print("[+] تم تحديث كافة مصفوفات الارتباك والرسوم الموحدة بنجاح!")
-
+    print("[+] تم حساب وحفظ جميع المخططات المباشرة والدقيقة بنجاح!")
 
 if __name__ == "__main__":
     evaluate_and_plot()

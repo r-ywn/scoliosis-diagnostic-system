@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 temp_xray.jpg
 .idea/
+# إهمال مجلدات البيانات والنتائج الضخمة
+data_raw/
+results/

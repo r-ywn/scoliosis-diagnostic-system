@@ -9,9 +9,20 @@ from scipy.interpolate import UnivariateSpline
 warnings.filterwarnings('ignore', category=UserWarning)
 
 BASE_DIR = r"D:\Scoliosis_Project"
-METADATA_CSV = os.path.join(BASE_DIR, r"data_raw\metadata.csv")
+METADATA_CSV = os.path.join(BASE_DIR, r"data_processed\clean_unified_metadata.csv")
+DATA_RAW_DIR = os.path.join(BASE_DIR, "data_raw")
 OUTPUT_DIR = os.path.join(BASE_DIR, r"results\shape_analysis")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def build_image_path_map(data_raw_dir):
+    image_map = {}
+    for root, _, files in os.walk(data_raw_dir):
+        for f in files:
+            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                if f not in image_map:
+                    image_map[f] = os.path.join(root, f)
+    return image_map
 
 
 def fit_spline_shape(landmarks_xy):
@@ -60,7 +71,6 @@ def parse_yolo_landmarks(label_path, img_width, img_height):
 
 
 def find_label_path_for_image(img_path):
-    """استخراج تلقائي لمسار ملف الترقيم .txt المترابط مع الصورة."""
     base_no_ext = os.path.splitext(img_path)[0]
     possible_paths = [
         base_no_ext + ".txt",
@@ -75,19 +85,23 @@ def find_label_path_for_image(img_path):
 
 def run_shape_analysis_evaluation():
     print("=" * 65)
-    print("[+] بدء التحليل الهندسي المطور باستخدام B-Splines")
+    print("[+] بدء التحليل الهندسي المطور باستخدام B-Splines على الميتاداتا الموحدة")
     print("=" * 65)
 
     if not os.path.exists(METADATA_CSV):
+        print(f"[ERROR] تعذر العثور على الميتاداتا الموحدة: {METADATA_CSV}")
         return
 
     df = pd.read_csv(METADATA_CSV)
+    path_map = build_image_path_map(DATA_RAW_DIR)
     results_summary = []
     sample_plots = 0
 
     for idx, row in df.iterrows():
-        img_path = str(row.get('image_path', ''))
-        if not os.path.exists(img_path):
+        img_name = str(row.get('image_name', ''))
+        img_path = path_map.get(img_name)
+
+        if not img_path or not os.path.exists(img_path):
             continue
 
         label_path = find_label_path_for_image(img_path)
@@ -106,7 +120,7 @@ def run_shape_analysis_evaluation():
         shape_class, fit_data, inflections = fit_spline_shape(landmarks)
 
         results_summary.append({
-            "image_path": img_path,
+            "image_name": img_name,
             "detected_shape": shape_class,
             "inflection_points": inflections
         })
@@ -134,7 +148,7 @@ def run_shape_analysis_evaluation():
             print(f"- {shape_name}: {count:,} حالة ({count/len(summary_df)*100:.1f}%)")
         summary_df.to_csv(os.path.join(OUTPUT_DIR, "geometric_shape_report.csv"), index=False)
     else:
-        print("[+] اكتمل الفحص: لا توجد صور تحتوي على ملفات ترقيم .txt في قاعدة البيانات الحالية.")
+        print("[+] اكتمل الفحص: لا توجد صور مرتبطة بملفات ترقيم .txt في الهيكل الحالي.")
 
 
 if __name__ == "__main__":

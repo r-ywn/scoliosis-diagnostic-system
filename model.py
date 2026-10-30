@@ -2,69 +2,68 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 
-
 class MultiTaskScoliosisResNet(nn.Module):
     def __init__(self, pretrained=True):
         super(MultiTaskScoliosisResNet, self).__init__()
 
-        # 1. تحميل النموذج المسبق التدريب (ResNet-18)
-        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
-        self.backbone = models.resnet18(weights=weights)
+        # استخدام ResNet-34 كعمود فقري بصري قوي
+        weights = models.ResNet34_Weights.DEFAULT if pretrained else None
+        self.backbone = models.resnet34(weights=weights)
 
-        # أخذ عدد ميزات الطبقة الأخيرة قبل إزالتها
         in_features = self.backbone.fc.in_features
         self.backbone.fc = nn.Identity()
 
-        # 2. طبقة فهم ميزات مشتركة (Shared Dense Layer)
+        # طبقة ميزات مشتركة مع BatchNorm و Dropout لحماية النموذج من Overfitting
         self.shared_fc = nn.Sequential(
-            nn.Linear(in_features, 256),
+            nn.Linear(in_features, 512),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Dropout(0.3)
+            nn.Dropout(0.4)
         )
 
-        # 3. رؤوس المخرجات الخمسة (Output Heads)
-        self.cobb_head = nn.Linear(256, 4)  # Regression (Upper, Main, Lumbar, Max)
-        self.intensity_head = nn.Linear(256, 4)  # Classification (Healthy, Mild, Moderate, Severe)
-        self.stat_head = nn.Linear(256, 4)  # Classification (0, 1, 2, 3 derece)
-        self.shape_head = nn.Linear(256, 3)  # Classification (Normal, C, S)
-        self.location_head = nn.Linear(256, 4)  # Classification (None, Upper, Thoracic, Lumbar)
+        # 1. رأس الانحدار لزوايا كوب المنمطة (UT, MT, Lumbar, Max)
+        self.cobb_head = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Linear(128, 4)
+        )
+
+        # 2. رأس تصنيف الشدة (Healthy, Mild, Moderate, Severe)
+        self.intensity_head = nn.Linear(512, 4)
+
+        # 3. رأس تصنيف الدرجة (0-derece, 1-derece, 2-derece, 3-derece)
+        self.stat_head = nn.Linear(512, 4)
+
+        # 4. رأس تصنيف الشكل الهندسي (Normal, C, S)
+        self.shape_head = nn.Linear(512, 3)
+
+        # 5. رأس تصنيف الموقع (None, Upper Thoracic, Thoracic, Lumbar)
+        self.location_head = nn.Linear(512, 4)
 
     def forward(self, x):
-        # استخراج الميزات البصرية من العمود الفقري
         features = self.backbone(x)
         shared_features = self.shared_fc(features)
 
-        # التنبؤ بالمخرجات الخمسة متوازية
-        cobb = self.cobb_head(shared_features)
-        intensity = self.intensity_head(shared_features)
-        stat = self.stat_head(shared_features)
-        shape = self.shape_head(shared_features)
-        location = self.location_head(shared_features)
-
         return {
-            "cobb_angles": cobb,
-            "intensity": intensity,
-            "stat": stat,
-            "shape": shape,
-            "location": location
+            "cobb_angles": self.cobb_head(shared_features),
+            "intensity": self.intensity_head(shared_features),
+            "stat": self.stat_head(shared_features),
+            "shape": self.shape_head(shared_features),
+            "location": self.location_head(shared_features)
         }
 
-
 if __name__ == "__main__":
-    print("جاري اختبار هيكل النموذج (Multi-Task ResNet-18)...")
-
-    # اختيار الجهاز الحسابي (GPU كارت الشاشة إن وجد)
+    print("جاري اختبار معمارية النموذج المحدثة (Multi-Task ResNet-34)...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f" تم توجيه النموذج للعمل على: {device}")
+    print(f"[+] الجهاز المستخدم للاختبار: {device}")
 
     model = MultiTaskScoliosisResNet(pretrained=True).to(device)
-
-    # تجربة إدخال عينة صور وهمية للتحقق من سلامة الأبعاد
-    dummy_input = torch.randn(2, 3, 224, 224).to(device)  # دفعة من صورتين
+    dummy_input = torch.randn(2, 3, 224, 224).to(device)
     outputs = model(dummy_input)
 
-    print("\n تم بناء وتجربة هيكل النموذج بنجاح!")
+    print("\n تم تجربة واختبار معمارية النموذج بنجاح!")
     print(f" أبعاد مخرج زوايا كوب (Cobb Angles Output): {outputs['cobb_angles'].shape}")
-    print(f"️ أبعاد مخرج الشدة (Intensity Output): {outputs['intensity'].shape}")
-    print(f"️ أبعاد مخرج الشكل (Shape Output): {outputs['shape'].shape}")
-    print(f"️ أبعاد مخرج الموقع (Location Output): {outputs['location'].shape}")
+    print(f" أبعاد مخرج الشدة (Intensity Output): {outputs['intensity'].shape}")
+    print(f" أبعاد مخرج الدرجة (Stat Output): {outputs['stat'].shape}")
+    print(f" أبعاد مخرج الشكل (Shape Output): {outputs['shape'].shape}")
+    print(f" أبعاد مخرج الموقع (Location Output): {outputs['location'].shape}")

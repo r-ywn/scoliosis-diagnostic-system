@@ -74,40 +74,13 @@ class PureGradCAMPlusPlus:
         return heatmap
 
 
-def apply_torso_centered_attenuation(heatmap, img_shape):
-    """تطبيق تنعيم بؤري تدريجي لمنع انتفاخ الخريطة الحرارية نحو الحواف الخارجية للصور."""
-    h, w = img_shape
-    if heatmap.shape != (h, w):
-        heatmap = cv2.resize(heatmap, (w, h), interpolation=cv2.INTER_CUBIC)
-
-    x = np.linspace(-1, 1, w)
-    y = np.linspace(-1, 1, h)
-    xx, yy = np.meshgrid(x, y)
-
-    # مرشح جيب التمام الملساء لتخفيف التشتت الخارجي
-    mask_x = np.cos(xx * np.pi * 0.45) ** 2
-    mask_x[np.abs(xx) > 0.85] = 0
-
-    mask_y = np.cos(yy * np.pi * 0.45) ** 2
-    mask_y[np.abs(yy) > 0.85] = 0
-
-    smooth_mask = mask_x * mask_y
-    focused_heatmap = heatmap * smooth_mask
-
-    max_v = np.max(focused_heatmap)
-    if max_v > 0:
-        focused_heatmap = focused_heatmap / max_v
-
-    return focused_heatmap
-
-
 def generate_refined_gradcam_grid():
     print("=" * 65)
-    print("[+] توليد خرائط Grad-CAM++ المجمعة والمركبة على العمود الفقري")
+    print("[+] توليد خرائط Grad-CAM++ المنقاة والمتركزة على العمود الفقري")
     print("=" * 65)
 
     if not os.path.exists(METADATA_CSV) or not os.path.exists(MODEL_PATH):
-        print(f"[ERROR] تعذر العثور على الميتاداتا النظيفة أو أوزان النموذج!")
+        print(f"[ERROR] تعذر العثور على الميتاداتا أو أوزان النموذج!")
         return
 
     df = pd.read_csv(METADATA_CSV)
@@ -149,10 +122,20 @@ def generate_refined_gradcam_grid():
             pred_class = torch.argmax(outputs['intensity'], dim=1).item()
 
         raw_heatmap = grad_cam.generate_heatmap(tensor_img, target_class=pred_class)
-        focused_heatmap = apply_torso_centered_attenuation(raw_heatmap, (h, w))
 
-        heatmap_colored = cv2.applyColorMap(np.uint8(255 * focused_heatmap), cv2.COLORMAP_JET)
-        overlay = cv2.addWeighted(raw_bgr, 0.60, heatmap_colored, 0.40, 0)
+        # تصفية رياضية لعزل القيم الضعيفة على الحواف وبقاء التنبيه على الفقرات حصراً
+        raw_heatmap[raw_heatmap < 0.25] = 0.0
+        max_v = np.max(raw_heatmap)
+        if max_v > 0:
+            raw_heatmap = raw_heatmap / max_v
+
+        heatmap_resized = cv2.resize(raw_heatmap, (w, h), interpolation=cv2.INTER_CUBIC)
+        heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
+
+        # إزالة الألوان من المناطق الصفريّة الخالية من التنشيط
+        heatmap_colored[heatmap_resized == 0] = 0
+
+        overlay = cv2.addWeighted(raw_bgr, 0.65, heatmap_colored, 0.35, 0)
 
         axes[idx, 0].imshow(cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2RGB))
         axes[idx, 0].set_title(f"Original X-Ray ({label_name})", fontsize=10)
@@ -163,14 +146,14 @@ def generate_refined_gradcam_grid():
         axes[idx, 1].axis('off')
 
         axes[idx, 2].imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
-        axes[idx, 2].set_title("Spine Focus Overlay", fontsize=10)
+        axes[idx, 2].set_title("Neural Focus Overlay", fontsize=10)
         axes[idx, 2].axis('off')
 
     plt.tight_layout()
     summary_path = os.path.join(os.path.dirname(OUTPUT_DIR), "gradcam_summary_grid.png")
     plt.savefig(summary_path, dpi=300)
     plt.close()
-    print(f"[+] تم تحديث وحفظ الخريطة الحرارية المجمعة بنجاح في: {summary_path}")
+    print(f"[+] تم إعادة توليد وتنقية الخرائط الحرارية بنجاح في: {summary_path}")
 
 
 if __name__ == "__main__":
